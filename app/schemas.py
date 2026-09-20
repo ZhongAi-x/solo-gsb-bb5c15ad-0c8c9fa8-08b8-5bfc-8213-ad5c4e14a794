@@ -113,6 +113,39 @@ class NamedFormula(BaseModel):
     formula: str = Field(..., min_length=1, description="仅含白名单运算的测量公式")
 
 
+class MonteCarloRequest(BaseModel):
+    """蒙特卡洛传播请求：复用 inputs/formula/correlation_matrix 校验，附样本数与随机种子。"""
+
+    inputs: list[InputQuantity] = Field(..., min_length=1)
+    formula: str = Field(..., min_length=1, description="仅含白名单运算的非线性测量公式")
+    correlation_matrix: list[list[FiniteFloat]] | None = Field(
+        default=None,
+        description="输入量相关系数矩阵，顺序与 inputs 一致；缺省为单位阵（互不相关）",
+    )
+    samples: int = Field(
+        ...,
+        ge=1000,
+        le=100000,
+        description="蒙特卡洛样本数（1000～100000）",
+    )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+        description="可选随机种子；固定 seed 时采样结果可复现，缺省则非确定性",
+    )
+
+    @field_validator("samples", "seed", mode="before")
+    @classmethod
+    def _reject_bool_int(cls, value: Any, info: Any) -> Any:
+        """与数值字段口径一致：拒绝把 true/false 当作整数（seed 允许 null）。"""
+        if isinstance(value, bool):
+            raise PydanticCustomError(
+                "int_type", f"{info.field_name} 必须是整数，不能是布尔值"
+            )
+        return value
+
+
 class JointPropagationRequest(BaseModel):
     """多输出联合传播请求：同一组输入量、同一相关矩阵，2～8 条输出公式。"""
 
@@ -272,3 +305,53 @@ class AllocationResponse(PropagationResponse):
         ..., description="回显目标合成标准不确定度（值/单位）"
     )
     variance_quadratic: VarianceQuadraticCoefficients
+
+
+class MonteCarloQuantiles(BaseModel):
+    """输出样本的 2.5%/50%/97.5% 分位数（单位与输出一致）。"""
+
+    q025: float = Field(..., alias="0.025", description="2.5% 分位数")
+    q500: float = Field(..., alias="0.5", description="中位数（50% 分位数）")
+    q975: float = Field(..., alias="0.975", description="97.5% 分位数")
+
+
+class FirstOrderReference(BaseModel):
+    """同输入下 GUM 一阶传播结果，作为蒙特卡洛的对比基准。"""
+
+    value: float = Field(..., description="一阶传播的模型值（输入估计值处的公式值）")
+    unit: str
+    standard_uncertainty: float = Field(..., description="一阶合成标准不确定度")
+
+
+class RelativeDeviation(BaseModel):
+    """蒙特卡洛统计量相对一阶结果的相对偏差 (MC − 一阶)/|一阶|。
+
+    一阶值恰为 0 时相对偏差无定义，对应字段返回 null。
+    """
+
+    mean: float | None = Field(
+        ..., description="样本均值相对一阶模型值的偏差"
+    )
+    standard_uncertainty: float | None = Field(
+        ..., description="样本标准偏差相对一阶合成标准不确定度的偏差"
+    )
+
+
+class MonteCarloResponse(BaseModel):
+    """蒙特卡洛传播结果：样本统计量、分位数与一阶结果偏差。"""
+
+    result: QuantityResult = Field(
+        ...,
+        description="蒙特卡洛结果：value 为样本均值，standard_uncertainty 为样本标准偏差（ddof=1）",
+    )
+    quantiles: MonteCarloQuantiles
+    first_order: FirstOrderReference
+    relative_deviation: RelativeDeviation
+    samples: int = Field(..., description="实际使用的样本数")
+    seed: int | None = Field(..., description="实际使用的随机种子（缺省时为 null）")
+    number_of_inputs: int = Field(..., description="参与传播的输入量数量")
+    correlation_matrix: list[list[float]] = Field(
+        ..., description="输入量相关系数矩阵（回显，顺序与 inputs 一致）"
+    )
+    formula: str
+    whitelist: list[str]

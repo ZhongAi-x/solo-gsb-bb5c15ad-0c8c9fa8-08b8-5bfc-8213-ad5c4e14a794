@@ -741,4 +741,333 @@ assert abs(cov[0][1]["value"] - (-0.03)) < 1e-12
 assert abs(b["output_correlation_matrix"][0][1] - (-0.6)) < 1e-12
 assert cov[0][1]["unit"] == "m ** 2"
 
+# --- POST /api/v1/propagate-monte-carlo -----------------------------------
+
+# 40) 非线性模型 y = x*y + exp(-x/2)，固定 seed 可复现，分位数单调
+_MC_BODY = {
+    "inputs": [
+        {"name": "x", "value": 1.0, "unit": "dimensionless", "standard_uncertainty": 0.05},
+        {"name": "y", "value": 2.0, "unit": "dimensionless", "standard_uncertainty": 0.05},
+    ],
+    "formula": "x*y + exp(-x/2)",
+    "correlation_matrix": [[1.0, 0.3], [0.3, 1.0]],
+    "samples": 10000,
+    "seed": 20240517,
+}
+r = client.post("/api/v1/propagate-monte-carlo", json=_MC_BODY)
+show("40) Monte Carlo x*y+exp(-x/2)", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["samples"] == 10000 and b["seed"] == 20240517 and b["number_of_inputs"] == 2
+assert b["result"]["unit"] == "dimensionless"
+# 一阶结果与 /propagate 完全一致
+r1 = client.post("/api/v1/propagate", json={k: _MC_BODY[k] for k in ("inputs", "formula", "correlation_matrix")})
+assert r1.status_code == 200
+assert b["first_order"]["value"] == r1.json()["result"]["value"]
+assert b["first_order"]["standard_uncertainty"] == r1.json()["result"]["standard_uncertainty"]
+# 样本均值接近一阶模型值；分位数 2.5% < 50% < 97.5%
+assert abs(b["result"]["value"] - b["first_order"]["value"]) < 0.02
+qs = b["quantiles"]
+assert qs["0.025"] < qs["0.5"] < qs["0.975"]
+assert set(qs) == {"0.025", "0.5", "0.975"}
+# 相对偏差字段存在且为数值
+assert isinstance(b["relative_deviation"]["mean"], float)
+assert isinstance(b["relative_deviation"]["standard_uncertainty"], float)
+
+# 41) 同 seed 复现：两次响应逐字节一致
+r2 = client.post("/api/v1/propagate-monte-carlo", json=_MC_BODY)
+assert r2.status_code == 200 and r2.json() == b
+
+# 41b) 不同 seed 一般得到不同样本统计
+body_other = dict(_MC_BODY, seed=20240518)
+r3 = client.post("/api/v1/propagate-monte-carlo", json=body_other)
+assert r3.status_code == 200
+assert r3.json()["quantiles"] != b["quantiles"]
+
+# 41c) 缺省 seed 时回显 null，且两次结果不同
+body_noseed = {k: v for k, v in _MC_BODY.items() if k != "seed"}
+ra = client.post("/api/v1/propagate-monte-carlo", json=body_noseed)
+rb = client.post("/api/v1/propagate-monte-carlo", json=body_noseed)
+assert ra.status_code == 200 and ra.json()["seed"] is None
+assert ra.json()["result"]["value"] != rb.json()["result"]["value"]
+
+# 42) 奇异半正定矩阵 r=1（秩 1）：x*y，一阶 uc=0.1*2+0.2*1=0.4，可运行
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 1.0, "unit": "m", "standard_uncertainty": 0.1},
+            {"name": "y", "value": 2.0, "unit": "m", "standard_uncertainty": 0.2},
+        ],
+        "formula": "x*y",
+        "correlation_matrix": [[1.0, 1.0], [1.0, 1.0]],
+        "samples": 20000,
+        "seed": 7,
+    },
+)
+show("42) singular r=1 Monte Carlo", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["first_order"]["standard_uncertainty"] == 0.4
+# 精确 Var((1+.1Z)(2+.2Z)) = 0.1604，sd≈0.4005；样本统计应接近
+assert abs(b["result"]["standard_uncertainty"] - 0.1604 ** 0.5) < 0.01
+
+# 42b) 3x3 秩亏损（z 不确定度为 0，x、y 完全相关）
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 1.0, "unit": "m", "standard_uncertainty": 0.1},
+            {"name": "y", "value": 2.0, "unit": "m", "standard_uncertainty": 0.1},
+            {"name": "z", "value": 3.0, "unit": "m", "standard_uncertainty": 0.0},
+        ],
+        "formula": "x+y+z",
+        "correlation_matrix": [[1, 1, 0], [1, 1, 0], [0, 0, 1]],
+        "samples": 4000,
+        "seed": 5,
+    },
+)
+assert r.status_code == 200, r.text
+assert abs(r.json()["first_order"]["standard_uncertainty"] - 0.2) < 1e-12
+assert abs(r.json()["result"]["standard_uncertainty"] - 0.2) < 0.01
+
+# 43) 无效域：sqrt 对部分样本取到负数 -> 422 invalid_sample_domain + 计数 + 首个索引
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 0.05, "unit": "dimensionless", "standard_uncertainty": 0.1},
+        ],
+        "formula": "sqrt(x)",
+        "samples": 3000,
+        "seed": 9,
+    },
+)
+show("43) sqrt invalid domain -> 422", r.json())
+assert r.status_code == 422
+err = r.json()["error"]
+assert err["code"] == "invalid_sample_domain"
+assert err["invalid_sample_count"] > 0
+assert 0 <= err["first_invalid_sample_index"] < 3000
+assert err["loc"] == ["formula"]
+
+# 43b) asin 越界、log 取到负数同样返回 invalid_sample_domain
+for formula, nominal, u in [("asin(x)", 0.99, 0.05), ("log(x)", 0.5, 1.0)]:
+    r = client.post(
+        "/api/v1/propagate-monte-carlo",
+        json={
+            "inputs": [
+                {"name": "x", "value": nominal, "unit": "dimensionless", "standard_uncertainty": u},
+            ],
+            "formula": formula,
+            "samples": 5000,
+            "seed": 3,
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_sample_domain"
+
+# 43c) 首个无效样本索引与计数随 seed 可复现（同参数再发一次完全一致）
+r_again = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 0.05, "unit": "dimensionless", "standard_uncertainty": 0.1},
+        ],
+        "formula": "sqrt(x)",
+        "samples": 3000,
+        "seed": 9,
+    },
+)
+assert r_again.status_code == 422
+err_again = r_again.json()["error"]
+assert err_again["invalid_sample_count"] == err["invalid_sample_count"]
+assert err_again["first_invalid_sample_index"] == err["first_invalid_sample_index"]
+
+# 44) samples 越界（<1000 / >100000）-> 422 定位 samples
+for bad_n in (999, 100001):
+    r = client.post(
+        "/api/v1/propagate-monte-carlo",
+        json={
+            "inputs": [
+                {"name": "x", "value": 1.0, "unit": "m", "standard_uncertainty": 0.1},
+            ],
+            "formula": "x*2",
+            "samples": bad_n,
+        },
+    )
+    assert r.status_code == 422 and r.json()["error"]["loc"] == ["samples"]
+
+# 44b) 边界 1000 与 100000 均可运行
+for good_n in (1000, 100000):
+    r = client.post(
+        "/api/v1/propagate-monte-carlo",
+        json={
+            "inputs": [
+                {"name": "x", "value": 1.0, "unit": "m", "standard_uncertainty": 0.1},
+            ],
+            "formula": "x*2",
+            "samples": good_n,
+            "seed": 1,
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["samples"] == good_n
+
+# 45) seed 非法（布尔 / 负数 / 浮点）-> 422
+for bad_seed in (True, -1, 1.5):
+    r = client.post(
+        "/api/v1/propagate-monte-carlo",
+        json={
+            "inputs": [
+                {"name": "x", "value": 1.0, "unit": "m", "standard_uncertainty": 0.1},
+            ],
+            "formula": "x*2",
+            "samples": 1000,
+            "seed": bad_seed,
+        },
+    )
+    assert r.status_code == 422
+
+# 46) 常数公式：散布为零，均值=一阶值，uc 相对偏差为 null，三分位数相等
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 1.0, "unit": "m", "standard_uncertainty": 0.1},
+        ],
+        "formula": "pi*E",
+        "samples": 2000,
+        "seed": 1,
+    },
+)
+show("46) constant formula -> zero spread", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["result"]["standard_uncertainty"] == 0.0
+assert b["result"]["value"] == b["first_order"]["value"]
+assert b["relative_deviation"]["mean"] == 0.0
+assert b["relative_deviation"]["standard_uncertainty"] is None
+assert b["quantiles"]["0.025"] == b["quantiles"]["0.5"] == b["quantiles"]["0.975"]
+
+# 46b) 一阶值为 0 时（x*2，名义值 0）均值相对偏差有定义；uc 非 0；构造一阶 uc=0 情形：
+#     公式 0*x（灵敏度 0），uc 相对偏差应为 null
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 3.0, "unit": "m", "standard_uncertainty": 0.1},
+        ],
+        "formula": "0*x",
+        "samples": 2000,
+        "seed": 1,
+    },
+)
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["first_order"]["standard_uncertainty"] == 0.0
+assert b["result"]["standard_uncertainty"] == 0.0
+assert b["relative_deviation"]["standard_uncertainty"] is None
+
+# 47) 复用既有校验：相关系数越界 / 公式注入 / 量纲不一致
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 1, "unit": "m", "standard_uncertainty": 0.1},
+            {"name": "y", "value": 2, "unit": "m", "standard_uncertainty": 0.1},
+        ],
+        "formula": "x+y",
+        "correlation_matrix": [[1, 1.2], [1.2, 1]],
+        "samples": 1000,
+    },
+)
+assert r.status_code == 422 and r.json()["error"]["code"] == "correlation_out_of_range"
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 1, "unit": "m", "standard_uncertainty": 0.1},
+        ],
+        "formula": "__import__('os')",
+        "samples": 1000,
+    },
+)
+assert r.status_code == 422
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+            {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.02},
+        ],
+        "formula": "U + I",
+        "samples": 1000,
+    },
+)
+assert r.status_code == 422 and r.json()["error"]["code"] == "dimension_mismatch"
+
+# 48) 不确定度按输入单位解释：u=100 mV 等价 0.1 V，y=2U 时 uc≈0.2 V
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {
+                "name": "U",
+                "value": 10.0,
+                "unit": "V",
+                "standard_uncertainty": {"value": 100, "unit": "mV"},
+            },
+        ],
+        "formula": "U*2",
+        "samples": 10000,
+        "seed": 11,
+    },
+)
+show("48) u in mV", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["first_order"]["standard_uncertainty"] == 0.2
+assert abs(b["result"]["standard_uncertainty"] - 0.2) < 0.005
+
+# 49) 角度单位 deg：L*cos(theta)，均值接近 2cos30°≈1.732 m，单位 m
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "theta", "value": 30, "unit": "deg", "standard_uncertainty": 1},
+            {"name": "L", "value": 2.0, "unit": "m", "standard_uncertainty": 0.01},
+        ],
+        "formula": "L * cos(theta)",
+        "samples": 10000,
+        "seed": 2,
+    },
+)
+show("49) L*cos(theta deg)", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["result"]["unit"] == "m"
+assert abs(b["result"]["value"] - 3 ** 0.5) < 0.005
+
+# 50) exp(x) 非线性二阶效应：E[exp(X)]=exp(sigma^2/2)=1.00501…，
+#     MC 均值应明显偏离一阶值 1.0，而一阶 uc=0.1。
+r = client.post(
+    "/api/v1/propagate-monte-carlo",
+    json={
+        "inputs": [
+            {"name": "x", "value": 0.0, "unit": "dimensionless", "standard_uncertainty": 0.1},
+        ],
+        "formula": "exp(x)",
+        "samples": 100000,
+        "seed": 123,
+    },
+)
+show("50) exp(x) nonlinear mean shift", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["first_order"]["value"] == 1.0
+assert b["first_order"]["standard_uncertainty"] == 0.1
+assert abs(b["result"]["value"] - 1.005012520859401) < 0.0005
+assert b["relative_deviation"]["mean"] > 0.003
+
 print("\nALL TESTS PASSED")

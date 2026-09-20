@@ -106,15 +106,18 @@ def _prepare_inputs(req, allow_missing_uncertainty: bool = False) -> list[dict]:
     return prepared
 
 
-def evaluate_model(inputs: list[dict], formula: str) -> dict:
+def evaluate_model(inputs: list[dict], formula: str, expr=None) -> dict:
     """复用全部既有校验，求解模型值、单位与各输入量的灵敏度系数。
 
     返回字典包含：result_q（结果带单位量）、display_unit、
     sensitivities（[{input,value,unit}]）与 c_mags（与 inputs 同序的灵敏度
-    数值，以结果单位/输入单位表示）。相关矩阵的校验在调用前完成。
+    数值，以结果单位/输入单位表示），以及解析后的 ``expr``（供需要直接编译
+    表达式的调用方，如蒙特卡洛模块复用，避免重复解析）。相关矩阵的校验在
+    调用前完成。``expr`` 可由调用方预先解析后传入以复用。
     """
     names = {p["name"] for p in inputs}
-    expr = parse_formula(formula, names)
+    if expr is None:
+        expr = parse_formula(formula, names)
 
     # 量纲静态校验。
     symbol_dims = {p["symbol"]: p["unit"].dimensionality for p in inputs}
@@ -164,6 +167,7 @@ def evaluate_model(inputs: list[dict], formula: str) -> dict:
         )
 
     return {
+        "expr": expr,
         "result_q": result_q,
         "display_unit": display_unit,
         "sensitivities": sensitivities,

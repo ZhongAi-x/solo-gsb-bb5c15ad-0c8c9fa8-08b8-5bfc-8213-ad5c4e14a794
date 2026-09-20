@@ -8,12 +8,15 @@ from .allocation import allocate
 from .errors import UnprocessableError, request_validation_handler, unprocessable_handler
 from .formula import WHITELIST_DISPLAY
 from .joint import propagate_joint
+from .monte_carlo import propagate_monte_carlo
 from .propagation import propagate
 from .schemas import (
     AllocationRequest,
     AllocationResponse,
     JointPropagationRequest,
     JointPropagationResponse,
+    MonteCarloRequest,
+    MonteCarloResponse,
     PropagationRequest,
     PropagationResponse,
 )
@@ -75,6 +78,17 @@ _JOINT_EXAMPLE = {
     "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
 }
 
+_MC_EXAMPLE = {
+    "inputs": [
+        {"name": "x", "value": 1.0, "unit": "dimensionless", "standard_uncertainty": 0.05},
+        {"name": "y", "value": 2.0, "unit": "dimensionless", "standard_uncertainty": 0.05},
+    ],
+    "formula": "x*y + exp(-x/2)",
+    "correlation_matrix": [[1.0, 0.3], [0.3, 1.0]],
+    "samples": 10000,
+    "seed": 20240517,
+}
+
 
 @app.post(
     "/api/v1/propagate",
@@ -108,6 +122,27 @@ def calculate(req: PropagationRequest) -> dict:
 def calculate_joint(req: JointPropagationRequest) -> dict:
     """多输出联合传播：对同一输入协方差按一阶雅可比计算 JΣJᵀ，给出输出协方差与相关系数矩阵。"""
     return propagate_joint(req)
+
+
+@app.post(
+    "/api/v1/propagate-monte-carlo",
+    response_model=MonteCarloResponse,
+    tags=["uncertainty"],
+    responses={
+        422: {
+            "description": (
+                "样本落入公式无效域 invalid_sample_domain（附 invalid_sample_count 与 "
+                "first_invalid_sample_index），或相关矩阵非法、单位/量纲不兼容等"
+            )
+        }
+    },
+    openapi_extra={
+        "examples": {"非线性模型 x*y+exp(-x/2) 的蒙特卡洛校核": {"value": _MC_EXAMPLE}},
+    },
+)
+def calculate_monte_carlo(req: MonteCarloRequest) -> dict:
+    """相关输入量的蒙特卡洛传播：相关矩阵特征分解采样，统计均值/标准偏差/分位数并对比一阶结果。"""
+    return propagate_monte_carlo(req)
 
 
 @app.post(
