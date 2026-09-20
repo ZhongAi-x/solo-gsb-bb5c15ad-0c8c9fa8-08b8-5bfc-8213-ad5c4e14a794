@@ -11,6 +11,10 @@ $C=J\Sigma J^{T}$，一次返回 2～8 个输出量的值、单位、合成标�
 另提供**不确定度逆分配**接口：把某个输入量的标准不确定度视为未知量，在完整保留相关项
 的前提下反求满足目标合成标准不确定度的最大允许取值。
 
+另提供**蒙特卡洛传播校核**接口：对非线性测量模型生成相关正态输入样本（相关矩阵特征
+分解，奇异相关矩阵亦可运行），逐样本计算白名单公式，返回样本均值、标准不确定度、
+2.5%/50%/97.5% 分位数及相对一阶传播结果的偏差，用于校核 GUM 线性化近似。
+
 ## 启动
 
 单条命令一键启动（Docker Compose）：
@@ -35,6 +39,7 @@ docker compose up --build
 - `POST /api/v1/propagate` — 不确定度传播；相关矩阵非对称 / 非半正定 / 单位量纲不兼容 / 公式不合法时返回 **422**，错误体 `error.loc` 精确定位（如 `correlation_matrix.0.1`、`inputs.0.unit`、`formula`）
 - `POST /api/v1/propagate-joint` — 多输出联合传播（见下）
 - `POST /api/v1/allocate-uncertainty` — 不确定度逆分配（见下）
+- `POST /api/v1/propagate-monte-carlo` — 非线性模型的蒙特卡洛传播校核（见下）
 - 交互文档：`http://localhost:8000/docs`
 
 ### 多输出联合传播 `POST /api/v1/propagate-joint`
@@ -165,3 +170,87 @@ curl -s http://localhost:8000/api/v1/allocate-uncertainty \
 | `incompatible_unit` | `target_combined_uncertainty.unit` | 目标单位与公式输出量纲不一致 |
 
 相关矩阵非法、公式不合法、其余单位错误沿用传播接口的同一套校验与 code/loc。
+
+### 蒙特卡洛传播校核 `POST /api/v1/propagate-monte-carlo`
+
+请求体复用 `/api/v1/propagate` 的 `inputs`、`formula` 与 `correlation_matrix`
+校验（同样的白名单、量纲/单位检查与相关矩阵检查），额外要求：
+
+- `samples` — 蒙特卡洛抽样次数，整数 **1000～100000**；
+- `seed` — 可选随机数种子（非负整数，上限 $2^{63}-1$）；**给定后结果可复现**，
+  缺省（或显式 `null`）时每次抽样不同，响应中回显该值。
+
+输入量按**联合正态**建模：每个输入量的标准不确定度按其声明单位解释（支持
+`{value, unit}` 显式单位与前缀、角度、`degC/degF` 等偏移单位）；采样器对相关
+系数矩阵 $R$ 做特征分解 $R=V\,\mathrm{diag}(\lambda)\,V^{T}$，由标准正态样本 $Z$ 经
+
+$$
+X_{\mathrm{std}} = Z\,\mathrm{diag}(\sqrt{\lambda})\,V^{T}
+$$
+
+生成相关标准正态样本。零特征值方向不产生随机扰动，因此**半正定但奇异**的相关
+矩阵（如完全相关 $r=\pm1$）也可运行；非半正定矩阵仍返回 422。随后逐样本在 SI
+基准单位下计算白名单公式，结果换算回与一阶传播一致的显示单位。
+
+响应返回样本均值、样本标准不确定度（标准差，ddof=1）、2.5%/50%/97.5% 分位数
+（线性插值），并在 `first_order` 中给出同一请求的 GUM 一阶传播结果值与
+$u_c$，`deviation` 给出蒙特卡洛统计量相对一阶结果的绝对与相对偏差（分母为 0
+时相对偏差为 `null`）。非线性模型的均值偏移（如 $E[UI]=\mu_U\mu_I+\mathrm{Cov}(U,I)$、
+$E[e^X]=e^{\mu+\sigma^2/2}$）可由此直接校核。
+
+请求示例（$P=U\cdot I$，$r(U,I)=0.5$，50000 样本，固定 seed）：
+
+```bash
+curl -s http://localhost:8000/api/v1/propagate-monte-carlo \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {"name": "U", "value": 10.0, "unit": "V", "standard_uncertainty": 0.1},
+      {"name": "I", "value": 2.0, "unit": "A", "standard_uncertainty": 0.05}
+    ],
+    "formula": "U*I",
+    "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]],
+    "samples": 50000,
+    "seed": 20260920
+  }'
+```
+
+响应（节选；同一 seed 下逐位可复现）：
+
+```json
+{
+  "result": {"value": 20.003213420755007, "unit": "W", "standard_uncertainty": 0.6246478040599004},
+  "quantiles": {"2.5%": 18.77668552065427, "50%": 20.003869077776333, "97.5%": 21.22478366919415},
+  "samples": 50000,
+  "seed": 20260920,
+  "first_order": {"value": 20.0, "unit": "W", "standard_uncertainty": 0.6244997998398398},
+  "deviation": {
+    "mean_absolute": 0.003213420755006524,
+    "mean_relative": 0.0001606710377503262,
+    "standard_uncertainty_absolute": 0.00014800422006056024,
+    "standard_uncertainty_relative": 0.00023699642513659352
+  }
+}
+```
+
+若**任一样本**落入公式无效域（`sqrt`/`log` 取非正、`asin`/`acos` 越界、零的负
+次幂、数值溢出等导致结果非有限），返回 **422**，`code` 为
+`invalid_sample_domain`，`loc` 为 `["formula"]`，并在 `error.details` 中给出
+失败样本数量 `failed_samples` 与首个失败样本索引 `first_invalid_sample_index`
+（从 0 开始；同时回显 `samples` 与 `seed` 便于复现）。例如 `log(x)` 在
+$x=0.01$、$u(x)=1$ 时：
+
+```json
+{
+  "error": {
+    "code": "invalid_sample_domain",
+    "message": "5012 个蒙特卡洛样本落入公式无效域（首个为第 2 个样本）；请检查公式定义域与输入不确定度",
+    "loc": ["formula"],
+    "details": {"failed_samples": 5012, "first_invalid_sample_index": 2, "samples": 10000, "seed": 7}
+  }
+}
+```
+
+`samples` 越界、`seed` 非法（负数或超过 $2^{63}-1$）返回 **422** 并定位到对应
+字段；相关矩阵非法、单位/量纲不兼容、公式不合法等沿用传播接口的同一套校验与
+code/loc。

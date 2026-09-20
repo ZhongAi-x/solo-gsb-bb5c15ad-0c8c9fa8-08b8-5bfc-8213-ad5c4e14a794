@@ -19,28 +19,38 @@ class UnprocessableError(Exception):
     ``["correlation_matrix", 1, 2]`` 或 ``["formula"]``。
     """
 
-    def __init__(self, message: str, loc: list[str | int], code: str = "invalid") -> None:
+    def __init__(
+        self,
+        message: str,
+        loc: list[str | int],
+        code: str = "invalid",
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.loc = loc
         self.code = code
+        self.details = details
 
 
-def _error_response(code: str, message: str, loc: list[Any] | None = None) -> JSONResponse:
-    return JSONResponse(
-        status_code=422,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "loc": loc or [],
-            }
-        },
-    )
+def _error_response(
+    code: str,
+    message: str,
+    loc: list[Any] | None = None,
+    details: dict[str, Any] | None = None,
+) -> JSONResponse:
+    error: dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "loc": loc or [],
+    }
+    if details is not None:
+        error["details"] = details
+    return JSONResponse(status_code=422, content={"error": error})
 
 
 async def unprocessable_handler(_: Request, exc: UnprocessableError) -> JSONResponse:
-    return _error_response(exc.code, exc.message, exc.loc)
+    return _error_response(exc.code, exc.message, exc.loc, exc.details)
 
 
 async def request_validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:

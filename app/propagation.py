@@ -109,9 +109,10 @@ def _prepare_inputs(req, allow_missing_uncertainty: bool = False) -> list[dict]:
 def evaluate_model(inputs: list[dict], formula: str) -> dict:
     """复用全部既有校验，求解模型值、单位与各输入量的灵敏度系数。
 
-    返回字典包含：result_q（结果带单位量）、display_unit、
-    sensitivities（[{input,value,unit}]）与 c_mags（与 inputs 同序的灵敏度
-    数值，以结果单位/输入单位表示）。相关矩阵的校验在调用前完成。
+    返回字典包含：result_q（结果带单位量）、display_unit、expr（解析后的
+    SymPy 表达式）、sensitivities（[{input,value,unit}]）与 c_mags（与
+    inputs 同序的灵敏度数值，以结果单位/输入单位表示）。相关矩阵的校验在
+    调用前完成。
     """
     names = {p["name"] for p in inputs}
     expr = parse_formula(formula, names)
@@ -166,6 +167,7 @@ def evaluate_model(inputs: list[dict], formula: str) -> dict:
     return {
         "result_q": result_q,
         "display_unit": display_unit,
+        "expr": expr,
         "sensitivities": sensitivities,
         "c_mags": c_mags,
     }

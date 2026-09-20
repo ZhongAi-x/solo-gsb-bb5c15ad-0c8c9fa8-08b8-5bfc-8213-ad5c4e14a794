@@ -272,3 +272,90 @@ class AllocationResponse(PropagationResponse):
         ..., description="回显目标合成标准不确定度（值/单位）"
     )
     variance_quadratic: VarianceQuadraticCoefficients
+
+
+# -- 蒙特卡洛传播 ---------------------------------------------------------
+
+
+class MonteCarloPropagationRequest(BaseModel):
+    """蒙特卡洛传播校核请求：inputs/formula/correlation_matrix 与传播接口一致。"""
+
+    inputs: list[InputQuantity] = Field(..., min_length=1)
+    formula: str = Field(..., min_length=1, description="仅含白名单运算的测量公式")
+    correlation_matrix: list[list[FiniteFloat]] | None = Field(
+        default=None,
+        description="输入量相关系数矩阵，顺序与 inputs 一致；须半正定（允许奇异），缺省为单位阵",
+    )
+    samples: int = Field(
+        ...,
+        ge=1000,
+        le=100_000,
+        description="蒙特卡洛抽样次数（1000～100000）",
+    )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+        description="可选随机数种子（非负整数）；给定后结果可复现，缺省则每次不同",
+    )
+
+
+class Quantiles(BaseModel):
+    """输出量样本的 2.5% / 50% / 97.5% 分位数（线性插值）。"""
+
+    q025: float = Field(..., serialization_alias="2.5%", description="2.5% 分位数")
+    q50: float = Field(..., serialization_alias="50%", description="中位数（50% 分位数）")
+    q975: float = Field(..., serialization_alias="97.5%", description="97.5% 分位数")
+
+    model_config = {"populate_by_name": True}
+
+
+class FirstOrderSummary(BaseModel):
+    """同一请求的 GUM 一阶传播结果摘要。"""
+
+    value: float = Field(..., description="一阶传播在输入估计值处的模型输出值")
+    unit: str
+    standard_uncertainty: float = Field(
+        ..., description="一阶合成标准不确定度 u_c（线性化近似）"
+    )
+
+
+class DeviationSummary(BaseModel):
+    """蒙特卡洛结果相对一阶传播结果的偏差（绝对差与相对差）。"""
+
+    mean_absolute: float = Field(
+        ..., description="样本均值与一阶结果值之差（蒙特卡洛 − 一阶）"
+    )
+    mean_relative: float | None = Field(
+        ..., description="均值相对偏差；一阶结果值为 0 时无定义（null）"
+    )
+    standard_uncertainty_absolute: float = Field(
+        ..., description="样本标准差与一阶 u_c 之差（蒙特卡洛 − 一阶）"
+    )
+    standard_uncertainty_relative: float | None = Field(
+        ..., description="标准不确定度相对偏差；一阶 u_c 为 0 时无定义（null）"
+    )
+
+
+class MonteCarloPropagationResponse(BaseModel):
+    """蒙特卡洛传播响应：样本统计量、分位数及相对一阶传播结果的偏差。"""
+
+    result: QuantityResult = Field(
+        ...,
+        description="样本均值（value）、单位与样本标准不确定度（标准差，ddof=1）",
+    )
+    quantiles: Quantiles
+    samples: int = Field(..., description="实际参与统计的抽样次数")
+    seed: int | None = Field(..., description="回显随机数种子；未指定时为 null")
+    number_of_inputs: int
+    correlation_matrix: list[list[float]] = Field(
+        ..., description="输入量相关系数矩阵（回显，顺序与 inputs 一致）"
+    )
+    first_order: FirstOrderSummary = Field(
+        ..., description="同一模型的 GUM 一阶传播结果，供对照校核"
+    )
+    deviation: DeviationSummary = Field(
+        ..., description="蒙特卡洛统计量相对一阶传播结果的偏差"
+    )
+    formula: str
+    whitelist: list[str]
